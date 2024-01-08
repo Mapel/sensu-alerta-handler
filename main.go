@@ -5,25 +5,28 @@ import (
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
-	"os"
 	"net/http"
+	"os"
 	"strings"
 
 	corev2 "github.com/sensu/sensu-go/api/core/v2"
 	"github.com/sensu/sensu-plugins-go-library/sensu"
 )
+
 // HandlerConfig represents plugin configuration settings.
 type HandlerConfig struct {
 	sensu.PluginConfig
-	AlertaEndpoint       string
-	AlertaAPIKey         string
-	Environment          string
+	AlertaEndpoint string
+	AlertaAPIKey   string
+	Environment    string
+	Heartbeat      bool
 }
 
 const (
 	endpointURL = "endpoint-url"
 	apiKey      = "api-key"
 	environment = "environment"
+	heartbeat   = "heartbeat"
 
 	defaultEndpointURL string = "http://localhost:8080"
 )
@@ -65,12 +68,20 @@ var (
 			Usage:     "Environment eg. Production, Development",
 			Value:     &config.Environment,
 		},
+		{
+			Path:      heartbeat,
+			Argument:  heartbeat,
+			Shorthand: "B",
+			Default:   false,
+			Usage:     "Create heartbeat instead of alert",
+			Value:     &config.Heartbeat,
+		},
 	}
 )
 
 func main() {
-  goHandler := sensu.NewGoHandler(&config.PluginConfig, alertaConfigOptions, checkArgs, sendAlert)
-  goHandler.Execute()
+	goHandler := sensu.NewGoHandler(&config.PluginConfig, alertaConfigOptions, checkArgs, sendAlert)
+	goHandler.Execute()
 }
 
 func checkArgs(event *corev2.Event) error {
@@ -82,23 +93,31 @@ func checkArgs(event *corev2.Event) error {
 
 // Alert represents an event to be sent to Alerta.
 type Alert struct {
-	Resource    string `json:"resource"`
-	Event       string `json:"event"`
-	Environment string `json:"environment"`
-	Severity    string `json:"severity"`
-	Correlate   []string `json:"correlate,omitempty"`
-	Status      string `json:"status"`
-	Service     []string `json:"service"`
-	Group       string `json:"group"`
-	Value       string `json:"value"`
-	Text        string `json:"text"`
-	Tags        []string `json:"tags,omitempty"`
+	Resource    string            `json:"resource"`
+	Event       string            `json:"event"`
+	Environment string            `json:"environment"`
+	Severity    string            `json:"severity"`
+	Correlate   []string          `json:"correlate,omitempty"`
+	Status      string            `json:"status"`
+	Service     []string          `json:"service"`
+	Group       string            `json:"group"`
+	Value       string            `json:"value"`
+	Text        string            `json:"text"`
+	Tags        []string          `json:"tags,omitempty"`
 	Attributes  map[string]string `json:"attributes,omitempty"`
-	Origin      string `json:"origin"`
-	Type        string `json:"type"`
-	CreateTime  string `json:"createTime,omitempty"`
-	Timeout     int `json:"timeout"`
-	RawData     string `json:"rawData"`
+	Origin      string            `json:"origin"`
+	Type        string            `json:"type"`
+	CreateTime  string            `json:"createTime,omitempty"`
+	Timeout     int               `json:"timeout"`
+	RawData     string            `json:"rawData"`
+}
+
+type Heartbeat struct {
+	Origin     string            `json:"origin"`
+	Tags       []string          `json:"tags,omitempty"`
+	Attributes map[string]string `json:"attributes,omitempty"`
+	CreateTime string            `json:"createTime,omitempty"`
+	Timeout    int               `json:"timeout"`
 }
 
 // TODO(satterly) could make these severity lookups configurable
@@ -135,27 +154,47 @@ func sendAlert(event *corev2.Event) error {
 	}
 
 	hostname, _ := os.Hostname()
-	data := &Alert{
-		Resource: event.Entity.Name,
-		Event: event.Check.Name,
-		Environment: environment,
-		Severity: eventSeverity(event),
-		Service: []string{"Sensu"},
-		Group: event.Check.Namespace,
-		Value: event.Check.State,
-		Text: event.Check.Output,
+
+	hb := &Heartbeat{
+		Origin:     event.Entity.Name,
 		Attributes: attributes,
-		Origin: fmt.Sprintf("sensu-go/%s", hostname),
-		Type: "sensuAlert",
-		RawData: event.Entity.String(),
+		Timeout:    int(event.Check.Interval),
+	}
+
+	data := &Alert{
+		Resource:    event.Entity.Name,
+		Event:       event.Check.Name,
+		Environment: environment,
+		Severity:    eventSeverity(event),
+		Service:     []string{"Sensu"},
+		Group:       event.Check.Namespace,
+		Value:       event.Check.State,
+		Text:        event.Check.Output,
+		Attributes:  attributes,
+		Origin:      fmt.Sprintf("sensu-go/%s", hostname),
+		Type:        "sensuAlert",
+		RawData:     event.Entity.String(),
 	}
 
 	buf := new(bytes.Buffer)
-	err := json.NewEncoder(buf).Encode(data)
+
+	var err error
+	if config.Heartbeat {
+		err = json.NewEncoder(buf).Encode(hb)
+	} else {
+		err = json.NewEncoder(buf).Encode(data)
+	}
+
 	if err != nil {
 		return err
 	}
-	url := fmt.Sprintf("%s/alert?api-key=%s", config.AlertaEndpoint, config.AlertaAPIKey)
+
+	var url string
+	if config.Heartbeat {
+		url = fmt.Sprintf("%s/heartbeat?api-key=%s", config.AlertaEndpoint, config.AlertaAPIKey)
+	} else {
+		url = fmt.Sprintf("%s/alert?api-key=%s", config.AlertaEndpoint, config.AlertaAPIKey)
+	}
 
 	resp, err := http.Post(url, "application/json", buf)
 	if err != nil {
